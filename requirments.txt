@@ -1,0 +1,9 @@
+aiohttp
+aiofiles
+dotenv
+loguru
+pydantic
+redis
+asyncio
+pyyaml
+lxml=6.0.2

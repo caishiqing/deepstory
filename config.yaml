@@ -1,0 +1,35 @@
+# ARQ 任务队列配置文件
+
+# Redis 连接配置
+redis:
+  host: localhost
+  port: 6379
+  database: 0
+  password: null
+  ssl: false
+  max_connections: 20
+
+# 队列配置 - 支持多个队列组
+queues:
+  image_generation:
+    name: "image_generation"
+    max_jobs: 1
+    job_timeout: 1800
+    keep_result: 7200
+    max_tries: 3
+    retry_delay: [30, 120, 300] 
+  
+  audio_processing:
+    name: "audio_processing"
+    max_jobs: 4
+    job_timeout: 300
+    keep_result: 7200
+    max_tries: 3
+    retry_delay: [5, 15, 45]
+
+# 全局设置
+global:
+  health_check_interval: 30
+  log_results: true
+  allow_abort_jobs: true
+  audio_search_threshold: 0.42

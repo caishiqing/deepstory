@@ -1,0 +1,8 @@
+.vscode
+__pycache__
+*.pyc
+test.*
+test_*.*
+projects/
+logs/
+renpy/
