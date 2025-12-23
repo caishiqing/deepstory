@@ -214,6 +214,47 @@ class TaskExecutionError(Exception):
 TaskCallback = Callable[[TaskResult], None]  # 任务完成回调函数类型
 
 
+class ResourceResult(BaseModel):
+    """资源生成结果 - 任务返回的统一格式
+
+    所有资源生成任务（图像、音频等）都应返回此格式，
+    包含资源 URL 和元数据，不再直接下载文件。
+    """
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        use_enum_values=True,
+    )
+
+    resource_type: str = Field(..., description="资源类型: image/audio/voice")
+    urls: List[str] = Field(default_factory=list, description="资源 URL 列表")
+
+    # Ren'Py 资源命名相关
+    tag: str = Field("", description="资源标签（如角色名拼音）")
+    attribute: Optional[str] = Field(None, description="资源属性（如情绪、年龄）")
+
+    # 元数据
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据")
+
+    @property
+    def primary_url(self) -> Optional[str]:
+        """获取主要 URL（第一个）"""
+        return self.urls[0] if self.urls else None
+
+    def get_renpy_name(self, index: int = 0) -> str:
+        """生成 Ren'Py 兼容的资源名称
+
+        Args:
+            index: URL 索引（当有多个 URL 时）
+
+        Returns:
+            Ren'Py 资源名称，如 'peter qingnian' 或 'bg bg1234'
+        """
+        if self.attribute:
+            return f"{self.tag} {self.attribute}"
+        return self.tag
+
+
 # 所有数据模型现在都可以直接使用 Pydantic 的内置序列化方法：
 # - model.model_dump_json() 转为 JSON 字符串
 # - model.model_dump() 转为字典

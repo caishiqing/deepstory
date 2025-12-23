@@ -305,8 +305,9 @@ def clean_sound_description(description: str):
 
 def clean_text(text: str):
     text = re.sub(r"（.*?）", "", text)
-    text = re.sub(r"\(.*?\)", "", text)
-    return text.replace('"', "").replace("%", "%%")
+    text = text.replace('"', "")
+    text = text.replace("%", "%%")
+    return text
 
 
 def infer_gender(text: str):

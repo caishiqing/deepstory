@@ -4,7 +4,7 @@ story.ai 任务管理包
 
 # 数据模型 - 统一数据类型定义
 from .models import (
-    TaskStatus, TaskInfo, TaskResult, PollingConfig,
+    TaskStatus, TaskInfo, TaskResult, PollingConfig, ResourceResult,
     TaskCallback, TaskTimeoutError, TaskExecutionError
 )
 

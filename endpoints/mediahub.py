@@ -198,7 +198,7 @@ async def text_to_speech(text: str,
             - radio: 对讲机/收音机（带电流声滋滋声）
 
     Returns:
-        dict: TTS响应，包含audio_hex(hex编码的音频数据)、audio_length、inference_time、rtf等信息
+        dict: TTS响应，包含audio_url(音频下载地址)、audio_length、inference_time、rtf等信息
     """
     client = MediaHubClient()
 

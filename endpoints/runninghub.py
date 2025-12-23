@@ -1,5 +1,6 @@
 from loguru import logger
 import aiohttp
+import asyncio
 import dotenv
 import os
 
@@ -10,25 +11,32 @@ dotenv.load_dotenv()
 
 class RunningHubClient:
 
-    def __init__(self, endpoint: str, api_key: str = None):
+    def __init__(self, endpoint: str = None, api_key: str = None, max_concurrency: int = None):
         self.endpoint = endpoint
         self.host = "www.runninghub.cn"
         self.api_key = api_key or os.getenv("RUNNINGHUB_API_KEY")
+        self.max_concurrency = max_concurrency or int(os.getenv("RUNNINGHUB_MAX_CONCURRENCY", "1"))
 
     @property
     def headers(self):
         return {
-            "host": self.host,
+            "Host": self.host,
             "Content-Type": "application/json"
         }
 
-    async def invoke(self, payload: dict):
+    async def invoke(self, payload: dict, path_prefix: str = "task"):
+        """发起 API 请求
+
+        Args:
+            payload: 请求参数
+            path_prefix: API 路径前缀，默认 "task"，账户接口使用 "uc"
+        """
         # 统一添加 apiKey
         payload["apiKey"] = self.api_key
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"https://{self.host}/task/openapi/{self.endpoint}",
+                f"https://{self.host}/{path_prefix}/openapi/{self.endpoint}",
                 json=payload,
                 headers=self.headers
             ) as response:
@@ -37,6 +45,43 @@ class RunningHubClient:
                 else:
                     text = await response.text()
                     raise Exception(text)
+
+    async def get_account_status(self) -> dict:
+        """获取账户信息
+
+        Returns:
+            dict: 账户信息，包含 currentTaskCounts 等字段
+        """
+        payload = {}
+        old_endpoint = self.endpoint
+        self.endpoint = "accountStatus"
+
+        try:
+            result = await self.invoke(payload, path_prefix="uc")
+            if result.get("code") != 0 or result.get("msg") != "success":
+                raise Exception(f"Failed to get account status: {result.get('msg')}")
+            return result["data"]
+        finally:
+            self.endpoint = old_endpoint
+
+    async def get_current_task_count(self) -> int:
+        """获取当前正在运行的任务数量"""
+        status = await self.get_account_status()
+        return int(status.get("currentTaskCounts", "0"))
+
+    async def wait_for_slot(self, check_interval: float = 5.0):
+        """等待并发槽位可用
+
+        Args:
+            check_interval: 检查间隔（秒），默认 5 秒
+        """
+        while True:
+            current_count = await self.get_current_task_count()
+            if current_count < self.max_concurrency:
+                logger.debug(f"Slot available: {current_count}/{self.max_concurrency}")
+                return
+            logger.info(f"Waiting for slot: {current_count}/{self.max_concurrency}, retry in {check_interval}s")
+            await asyncio.sleep(check_interval)
 
 
 @async_retry(max_attempts=3, delay=1.0, backoff=2.0)
@@ -74,6 +119,10 @@ async def create_runninghub_task(workflow_id: str,
         }
     """
     client = RunningHubClient("create")
+
+    # 等待并发槽位可用
+    await client.wait_for_slot()
+
     payload = {
         "workflowId": workflow_id
     }

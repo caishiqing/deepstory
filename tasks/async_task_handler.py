@@ -114,11 +114,6 @@ class TaskPoller:
                 # 获取任务状态
                 current_status = await task.get_status(task_id)
 
-                # 状态变化回调
-                if current_status != last_status:
-                    await task.callback(current_status)
-                    last_status = current_status
-
                 # 进度回调（可选）
                 if on_progress:
                     progress_info = {
@@ -129,23 +124,30 @@ class TaskPoller:
                     }
                     on_progress(progress_info)
 
+                # 状态变化回调（非终态时）
+                if current_status != last_status and current_status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                    await task.callback(current_status)
+                    last_status = current_status
+
                 # 检查终态
                 if current_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
                     try:
                         if current_status == TaskStatus.COMPLETED:
-                            result = await task.get_result(task_id)
+                            # 调用 callback 获取结构化结果（如 ResourceResult）
+                            callback_result = await task.callback(current_status)
                             return TaskResult(
                                 task_id=task_id,
                                 status=current_status,
-                                result=result,
-                                completed_at=time.time()  # 模型会自动转换
+                                result=callback_result,  # 使用 callback 返回的结构化结果
+                                completed_at=time.time()
                             )
                         else:
+                            await task.callback(current_status)
                             return TaskResult(
                                 task_id=task_id,
                                 status=current_status,
                                 error=f"Task ended with status: {current_status.value}",
-                                completed_at=time.time()  # 模型会自动转换
+                                completed_at=time.time()
                             )
                     except Exception as e:
                         logger.error(f"Error getting result for task {task_id}: {e}")
