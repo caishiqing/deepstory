@@ -19,11 +19,9 @@ RUNNINGHUB_COOLDOWN = 5
 class RunningHubTask(AsyncTask):
     """RunningHub 图像生成任务"""
 
-    def __init__(self, tag: str, attribute: str = None, task_id: str = None):
+    def __init__(self, task_id: str = None):
         super().__init__(task_id)
-        self.tag = tag
-        self.attribute = attribute
-        logger.info(f"RunningHubTask initialized: tag='{tag}', attribute='{attribute}'")
+        logger.info(f"RunningHubTask initialized: task_id='{task_id}'")
 
     async def _create(self, **kwargs) -> str:
         """创建 RunningHub 任务"""
@@ -84,30 +82,27 @@ class RunningHubTask(AsyncTask):
             return ResourceResult(
                 resource_type="image",
                 urls=urls,
-                tag=self.tag,
-                attribute=self.attribute,
                 metadata={"task_id": self.task_id, "file_count": len(urls)}
             )
 
         elif status in [TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT]:
-            logger.warning(f"Task ended with status {status.value}: {self.tag}")
+            logger.warning(f"Task ended with status {status.value}: task_id={self.task_id}")
             return None
 
 
 @task_logger("character_portrait")
-async def character_portrait(tag: str, description: str) -> ResourceResult:
+async def character_portrait(description: str) -> ResourceResult:
     """角色立绘
 
     Args:
-        tag: 角色标签（如 'peter5a qingnian'）
         description: 角色描述提示词
 
     Returns:
         ResourceResult: 包含图像 URL 的结果
     """
-    logger.info(f"Character portrait: {tag}")
+    logger.info(f"Character portrait: desc_len={len(description)}")
 
-    task = RunningHubTask(tag)
+    task = RunningHubTask()
     executor = TaskExecutor()
 
     params = {
@@ -124,20 +119,18 @@ async def character_portrait(tag: str, description: str) -> ResourceResult:
 
 
 @task_logger("scene_drawing")
-async def scene_drawing(tag: str, attribute: str, description: str) -> ResourceResult:
+async def scene_drawing(description: str) -> ResourceResult:
     """场景绘图
 
     Args:
-        tag: 场景标签（如 'bg'）
-        attribute: 场景属性（如 'bg1234'）
         description: 场景描述提示词
 
     Returns:
         ResourceResult: 包含图像 URL 的结果
     """
-    logger.info(f"Scene drawing: {tag} {attribute}")
+    logger.info(f"Scene drawing: desc_len={len(description)}")
 
-    task = RunningHubTask(tag, attribute)
+    task = RunningHubTask()
     executor = TaskExecutor()
 
     params = {

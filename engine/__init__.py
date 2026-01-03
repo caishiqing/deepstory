@@ -16,7 +16,7 @@ from .producer import (
     SceneStartEvent,
     DialogueEvent,
     NarrationEvent,
-    SoundEvent,
+    AudioEvent,
     StoryEndEvent,
 )
 
@@ -25,7 +25,6 @@ from .consumer import (
     OfflineConsumer,
     RenpyConsumer,
     StreamingConsumer,
-    DownloadedResource,
 )
 
 # 追踪器
@@ -43,13 +42,12 @@ __all__ = [
     "SceneStartEvent",
     "DialogueEvent",
     "NarrationEvent",
-    "SoundEvent",
+    "AudioEvent",
     "StoryEndEvent",
     # Consumer
     "OfflineConsumer",
     "RenpyConsumer",
     "StreamingConsumer",
-    "DownloadedResource",
     # Tracer
     "ResourceTracker",
     "TrackedResource",

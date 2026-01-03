@@ -34,15 +34,11 @@ from .models import SceneInfo, CharacterInfo, StoryInfo, ChapterInfo
 @dataclass
 class NarrativeEvent:
     """叙事事件基类"""
-    event_id: str
     event_type: str
 
     def to_dict(self) -> dict:
         """转换为字典"""
-        return {
-            "event_id": self.event_id,
-            "event_type": self.event_type
-        }
+        return {"event_type": self.event_type}
 
 
 @dataclass
@@ -78,12 +74,6 @@ class SceneStartEvent(NarrativeEvent):
 
     # 资源 key（由 Consumer 等待就绪后获取 URL）
     background_key: Optional[str] = None
-    music_key: Optional[str] = None
-    ambient_key: Optional[str] = None
-
-    # 音乐/音效描述（前端可用于显示）
-    music_desc: Optional[str] = None
-    ambient_desc: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -93,11 +83,7 @@ class SceneStartEvent(NarrativeEvent):
             "location": self.location,
             "time": self.time,
             "bg_id": self.bg_id,
-            "background_key": self.background_key,
-            "music_key": self.music_key,
-            "ambient_key": self.ambient_key,
-            "music_desc": self.music_desc,
-            "ambient_desc": self.ambient_desc
+            "background_key": self.background_key
         }
 
 
@@ -146,19 +132,34 @@ class NarrationEvent(NarrativeEvent):
 
 
 @dataclass
-class SoundEvent(NarrativeEvent):
-    """音效事件"""
-    event_type: str = "sound"
-    description: str = ""
-
-    # 资源 key
-    sound_key: Optional[str] = None
+class AudioEvent(NarrativeEvent):
+    """音频事件（音乐/环境音/音效）"""
+    event_type: str = "audio"
+    audio_key: Optional[str] = None
+    # music / ambient / sound
+    channel: Optional[str] = None
+    description: str = field(default="")
 
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
+            "channel": self.channel,
             "description": self.description,
-            "sound_key": self.sound_key
+            "audio_key": self.audio_key
+        }
+
+
+@dataclass
+class ChoiceEvent(NarrativeEvent):
+    event_type: str = "choice"
+    prompt: str = field(default="")
+    options: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "prompt": self.prompt,
+            "options": self.options
         }
 
 
@@ -364,14 +365,14 @@ class StoryEngine:
         self._save_scenes()
 
         bg_id = utils.get_bg_id(location, time)
-        resource_key = f"bg_{bg_id}"
+        resource_key = self._redis_key(f"bg_{bg_id}")
 
         logger.info(f"Scene drawing: {location} - {time} -> {bg_id}")
 
         await self.tracker.submit(
             key=resource_key,
             function="tasks.scene_drawing",
-            args=["bg", bg_id, scene_prompt],
+            args=[scene_prompt],
             queue="image_generation"
         )
 
@@ -416,14 +417,14 @@ class StoryEngine:
 
         # 提交立绘任务
         tag = self._character_tag(name, age)
-        resource_key = f"portrait_{tag}"
+        resource_key = self._redis_key(f"portrait_{tag}")
 
         logger.info(f"Character portrait: {name} - {age}")
 
         await self.tracker.submit(
             key=resource_key,
             function="tasks.character_portrait",
-            args=[tag, character_prompt],
+            args=[character_prompt],
             queue="image_generation"
         )
 
@@ -530,44 +531,45 @@ class StoryEngine:
                         music = xml_event["attrib"].get("music")
                         ambient = xml_event["attrib"].get("ambient")
 
-                        # 背景音乐
-                        music_key = None
-                        if music and music.lower() not in {"无", "none", "null"}:
-                            music_key = f"music_{scene_info.index}"
-                            await self.tracker.submit(
-                                key=music_key,
-                                function="tasks.sound_audio",
-                                args=[music, "music"],
-                                kwargs={"tag": f"m{scene_info.index}"},
-                                queue="audio_processing"
-                            )
-
-                        # 环境音效
-                        ambient_key = None
-                        if ambient and ambient.lower() not in {"无", "none", "null"}:
-                            ambient_key = f"ambient_{scene_info.index}"
-                            await self.tracker.submit(
-                                key=ambient_key,
-                                function="tasks.sound_audio",
-                                args=[ambient, "ambient"],
-                                kwargs={"tag": f"a{scene_info.index}"},
-                                queue="audio_processing"
-                            )
-
-                        # 立即产出事件（资源 key，不等待 URL）
+                        # 产出场景开始事件
                         yield SceneStartEvent(
-                            event_id=f"scene_{scene_info.index}",
                             scene_index=scene_info.index,
                             title=scene_info.title,
                             location=scene_info.location,
                             time=scene_info.time,
                             bg_id=bg_id,
-                            background_key=f"bg_{bg_id}",
-                            music_key=music_key,
-                            ambient_key=ambient_key,
-                            music_desc=music,
-                            ambient_desc=ambient
+                            background_key=self._redis_key(f"bg_{bg_id}")
                         )
+
+                        # 背景音乐
+                        if music and music.lower() not in {"无", "none", "null"}:
+                            music_key = self._redis_key(f"music_{scene_info.index}")
+                            await self.tracker.submit(
+                                key=music_key,
+                                function="tasks.sound_audio",
+                                args=[music, "music"],
+                                queue="audio_processing"
+                            )
+                            yield AudioEvent(
+                                channel="music",
+                                description=music,
+                                audio_key=music_key
+                            )
+
+                        # 环境音效
+                        if ambient and ambient.lower() not in {"无", "none", "null"}:
+                            ambient_key = self._redis_key(f"ambient_{scene_info.index}")
+                            await self.tracker.submit(
+                                key=ambient_key,
+                                function="tasks.sound_audio",
+                                args=[ambient, "ambient"],
+                                queue="audio_processing"
+                            )
+                            yield AudioEvent(
+                                channel="ambient",
+                                description=ambient,
+                                audio_key=ambient_key
+                            )
 
                     # 对话/独白
                     elif xml_event["event"] == "end" and xml_event["tag"] in ("dialogue", "monologue"):
@@ -593,19 +595,18 @@ class StoryEngine:
                                 f.write(xml_event["xml_text"] + "\n")
 
                         # 提交配音任务
-                        voice_key = f"voice_{event_index}"
+                        voice_key = self._redis_key(f"voice_{event_index}")
                         await self.tracker.submit(
                             key=voice_key,
                             function="tasks.dialogue_asr",
                             args=[voice_id, text],
-                            kwargs={"tag": f"d{event_index}", "emotion": emotion, "voice_effect": voice_effect},
+                            kwargs={"emotion": emotion, "voice_effect": voice_effect},
                             queue="audio_processing"
                         )
 
                         # 立即产出事件（资源 key，不等待 URL）
-                        image_key = f"portrait_{self._character_tag(char_name, char_age)}"
+                        image_key = self._redis_key(f"portrait_{self._character_tag(char_name, char_age)}")
                         yield DialogueEvent(
-                            event_id=f"dialogue_{event_index}",
                             character=char_name,
                             character_tag=self._character_tag(char_name, char_age),
                             text=text,
@@ -618,21 +619,20 @@ class StoryEngine:
                     # 音效
                     elif xml_event["event"] == "end" and xml_event["tag"] == "sound":
                         desc = utils.clean_sound_description(xml_event["text"])
-                        sound_key = f"sound_{event_index}"
+                        sound_key = self._redis_key(f"sound_{event_index}")
 
                         await self.tracker.submit(
                             key=sound_key,
                             function="tasks.sound_audio",
                             args=[desc, "action"],
-                            kwargs={"tag": f"s{event_index}"},
                             queue="audio_processing"
                         )
 
                         # 立即产出事件（资源 key，不等待 URL）
-                        yield SoundEvent(
-                            event_id=f"sound_{event_index}",
+                        yield AudioEvent(
+                            channel="sound",
                             description=desc,
-                            sound_key=sound_key
+                            audio_key=sound_key
                         )
 
                     # 旁白/动作
@@ -645,18 +645,17 @@ class StoryEngine:
                                 f.write(xml_event["xml_text"] + "\n")
 
                         if self.narration_voice:
-                            voice_key = f"narration_{event_index}"
+                            voice_key = self._redis_key(f"narration_{event_index}")
                             await self.tracker.submit(
                                 key=voice_key,
                                 function="tasks.dialogue_asr",
                                 args=[self.narration_voice, text],
-                                kwargs={"tag": f"n{event_index}", "emotion": "normal"},
+                                kwargs={"emotion": "normal"},
                                 queue="audio_processing"
                             )
 
                         # 立即产出事件（资源 key，不等待 URL）
                         yield NarrationEvent(
-                            event_id=f"narration_{event_index}",
                             text=text,
                             voice_key=voice_key
                         )
@@ -674,7 +673,6 @@ class StoryEngine:
 
         # 3. 输出故事开始事件
         yield StoryStartEvent(
-            event_id="story_start",
             title=self.title or "故事开始"
         )
 
@@ -687,7 +685,6 @@ class StoryEngine:
 
             elif scene_data["tag"] == "sequence":
                 yield ChapterStartEvent(
-                    event_id=f"chapter_{scene_data['idx']}",
                     chapter_index=scene_data["idx"],
                     title=scene_data["title"]
                 )
@@ -700,10 +697,10 @@ class StoryEngine:
                     yield event
 
         # 5. 输出故事结束事件
-        yield StoryEndEvent(event_id="story_end")
+        yield StoryEndEvent()
 
     async def _enqueue_scenes(self):
-        """将场景推入 Redis 队列"""
+        """将脚本推入 Redis 队列"""
         if not self.script:
             return
 
@@ -736,23 +733,6 @@ class StoryEngine:
                 self.cache.push(self._redis_key("storylets"), scene_info.to_dict(), ttl=self.cache_ttl)
 
     # ==================== 工具方法 ====================
-
-    async def wait_all_resources(self, timeout: float = 3600.0):
-        """等待所有资源生成完成"""
-        logger.info(f"Waiting for all resources ({self.tracker.pending_count} pending)...")
-
-        start_time = asyncio.get_event_loop().time()
-        while self.tracker.pending_count > 0:
-            elapsed = asyncio.get_event_loop().time() - start_time
-            if elapsed > timeout:
-                logger.warning(f"Timeout: {self.tracker.pending_count} resources still pending")
-                break
-
-            await asyncio.sleep(2.0)
-            if int(elapsed) % 30 == 0 and elapsed > 0:
-                logger.info(f"Progress: {self.tracker.pending_count} pending, {elapsed:.0f}s elapsed")
-
-        logger.info("All resources completed")
 
     def get_stats(self) -> dict:
         """获取引擎统计信息"""
