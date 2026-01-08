@@ -2,8 +2,9 @@ import aiohttp
 import json
 import dotenv
 import os
-from utils import async_retry, clean_xml
-from typing import Optional, Union, Dict, Any, AsyncGenerator
+from utils import async_retry, clean_xml, format_characters, format_tags
+from typing import Optional, Union, Dict, Any, AsyncGenerator, List
+from engine.models import StoryInput
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
@@ -409,6 +410,7 @@ def parse_json(text_or_json: Union[str, dict]) -> dict:
     if isinstance(text_or_json, dict):
         return text_or_json
 
+    text_or_json = text_or_json.strip()
     if text_or_json.startswith("```json"):
         return json.loads(text_or_json.strip("```json"))
 
@@ -459,29 +461,77 @@ async def scene_details(story: str, scene: str):
     return parse_json(result["scene"])
 
 
-async def infer_story(logline: str, roles: str, tags: str):
+@async_retry(max_attempts=3, delay=2.0)
+async def help_character_design(logline: str, tags: dict, character: dict):
+    """辅助角色设计"""
+    client = WorkflowClient(api_key=os.getenv("DIFY_CHARACTER_DESIGN_API_KEY"))
+    inputs = {
+        "logline": logline,
+        "tags": utils.format_tags(tags),
+        "description": character.pop("description"),
+        "profile": utils.format_characters([character]).strip()
+    }
+    result = await client.invoke(inputs)
+    return parse_json(result["result"])
+
+
+@async_retry(max_attempts=3, delay=2.0)
+async def help_create(logline: str):
+    """辅助创作"""
+    client = ChatflowClient(api_key=os.getenv("DIFY_HELP_CREATE_API_KEY"))
+    inputs = {
+        "logline": logline
+    }
+
+    # 生成角色设计
+    characters = await client.invoke("根据要求输出角色设计：", inputs)
+    characters = parse_json(characters)
+
+    # 生成人物关系
+    relationships = await client.invoke("根据要求输出人物关系：", inputs)
+    relationships = parse_json(relationships)
+
+    # 生成主题标签
+    tags = await client.invoke("根据要求输出主题标签：", inputs)
+    tags = parse_json(tags)
+
+    results = {
+        "characters": characters,
+        "relationships": relationships,
+        "tags": tags
+    }
+    return results
+
+
+async def infer_story(story_input: StoryInput):
     """
     故事脚本推理 - 流式生成
 
     Args:
-        logline: 一句话梗概
-        roles: 角色设计
-        tags: 类型标签
+        story_input: 故事创意输入模型
 
     Yields:
         dict: 包含 type 和 content 的字典
             - type: "think" 或 "output"
             - content: 文本内容
     """
+    # 格式化输入
+    characters_list = [char.to_dict() for char in story_input.characters]
+    relationships_list = [rel.to_dict() for rel in story_input.relationships] if story_input.relationships else None
+    tags_dict = story_input.tags.to_dict()
+
+    formatted_characters = format_characters(characters_list, relationships_list)
+    formatted_tags = format_tags(tags_dict)
+
     # client = ChatflowClient(api_key=os.getenv("DIFY_STORY_API_KEY"))
-    client = ChatflowClient(api_key="app-ViqtQqjelym7hCWUxHDUkzSI", base_url="http://124.70.27.4/v1")
+    client = ChatflowClient(api_key="app-ViqtQqjelym7hCWUxHDUkzSI")
     inputs = {
-        "roles": roles,
-        "tags": tags
+        "characters": formatted_characters,
+        "tags": formatted_tags
     }
 
     think = ""
-    async for chunk in client.stream(query=logline, inputs=inputs):
+    async for chunk in client.stream(query=story_input.logline, inputs=inputs):
         if chunk.startswith("<think>"):
             think += chunk
             continue
@@ -497,15 +547,26 @@ async def infer_story(logline: str, roles: str, tags: str):
             yield {"type": "output", "content": chunk}
 
 
-async def plan_story(logline: str, roles: str, tags: str):
+async def plan_story(story_input: StoryInput):
     """
     故事规划生成
+
+    Args:
+        story_input: 故事创意输入模型
     """
-    client = ChatflowClient(api_key="app-1fnB9ung55vvTmrPDoZFSDBy")
+    # 格式化输入
+    characters_list = [char.to_dict() for char in story_input.characters]
+    relationships_list = [rel.to_dict() for rel in story_input.relationships] if story_input.relationships else None
+    tags_dict = story_input.tags.to_dict()
+
+    formatted_characters = format_characters(characters_list, relationships_list)
+    formatted_tags = format_tags(tags_dict)
+
+    client = ChatflowClient(api_key=os.getenv("DIFY_STORY_API_KEY"))
     inputs = {
-        "logline": logline,
-        "roles": roles,
-        "tags": tags
+        "logline": story_input.logline,
+        "characters": formatted_characters,
+        "tags": formatted_tags
     }
 
     # 获取摘要总结
@@ -537,10 +598,17 @@ async def plan_story(logline: str, roles: str, tags: str):
             for character in scene_tgt.findall('character'):
                 scene_src.append(character)
 
-        seq_script = ET.tostring(seq, encoding="utf8", xml_declaration=False).decode()
-        reparsed = minidom.parseString(seq_script)
-        pretty_string = reparsed.toprettyxml(indent="    ")
-        for line in pretty_string.split('\n')[1:]:
+        # seq_script = ET.tostring(seq, encoding="utf8", xml_declaration=False).decode()
+        # reparsed = minidom.parseString(seq_script)
+        # pretty_string = reparsed.toprettyxml(indent="    ")
+        # for line in pretty_string.split('\n')[1:]:
+        #     if line.strip():
+        #         yield {"type": "output", "content": "    " + line + "\n"}
+        seq_script_elem = seq  # seq 已经是 ET.Element
+        ET.indent(seq_script_elem, space="    ")  # 就地格式化
+        seq_script = ET.tostring(seq_script_elem, encoding="unicode")
+
+        for line in seq_script.split('\n'):
             if line.strip():
                 yield {"type": "output", "content": "    " + line + "\n"}
 

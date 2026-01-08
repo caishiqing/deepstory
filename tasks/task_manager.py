@@ -379,8 +379,9 @@ class TaskManager:
         if task_info and task_info.status == TaskStatus.RETRYING:
             task_info.status = TaskStatus.PENDING
             await self._update_task_info(task_info)
-            await self.redis_client.lpush(RedisKeys.queue(queue_name), task_id)
-            logger.info(f"Task {task_id} requeued for retry")
+            # 使用 rpush 让重试任务插队到队列前端（靠近 brpop 取出端）
+            await self.redis_client.rpush(RedisKeys.queue(queue_name), task_id)
+            logger.info(f"Task {task_id} requeued for retry (priority)")
 
     async def get_queue_stats(self) -> Dict[str, Any]:
         """获取队列统计信息"""

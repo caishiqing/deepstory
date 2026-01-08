@@ -26,7 +26,7 @@ from endpoints import dify, mediahub
 import normalize
 import utils
 from cache import Cache
-from .models import SceneInfo, CharacterInfo, StoryInfo, ChapterInfo
+from .models import SceneInfo, CharacterInfo, StoryInfo, ChapterInfo, StoryInput
 
 
 # ==================== 事件定义 ====================
@@ -63,28 +63,54 @@ class ChapterStartEvent(NarrativeEvent):
 
 
 @dataclass
+class ChapterEndEvent(NarrativeEvent):
+    """章节结束事件"""
+    event_type: str = "chapter_end"
+    chapter_index: int = 0
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "chapter_index": self.chapter_index}
+
+
+@dataclass
 class SceneStartEvent(NarrativeEvent):
     """场景开始事件"""
     event_type: str = "scene_start"
+    scene_id: str = ""
     scene_index: str = ""
     title: str = ""
     location: str = ""
     time: str = ""
     bg_id: str = ""
 
-    # 资源 key（由 Consumer 等待就绪后获取 URL）
+    # 资源 key（内部使用，由 Consumer 等待就绪后获取 URL）
     background_key: Optional[str] = None
+
+    # 资源 URL（流式输出时填充）
+    background_url: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
+            "scene_id": self.scene_id,
             "scene_index": self.scene_index,
             "title": self.title,
             "location": self.location,
             "time": self.time,
             "bg_id": self.bg_id,
-            "background_key": self.background_key
+            "background_key": self.background_key,
+            "background_url": self.background_url
         }
+
+
+@dataclass
+class SceneEndEvent(NarrativeEvent):
+    """场景结束事件"""
+    event_type: str = "scene_end"
+    scene_id: str = ""
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "scene_id": self.scene_id}
 
 
 @dataclass
@@ -96,10 +122,24 @@ class DialogueEvent(NarrativeEvent):
     text: str = ""
     emotion: str = "normal"
     is_monologue: bool = False
+    portrait_position: str = "center"
+    voice_id: Optional[str] = None
 
-    # 资源 key（由 Consumer 等待就绪后获取 URL）
+    # 资源 key（内部使用，由 Consumer 等待就绪后获取 URL）
     voice_key: Optional[str] = None
     image_key: Optional[str] = None
+
+    # 资源 URL（流式输出时填充）
+    voice_url: Optional[str] = None
+    image_url: Optional[str] = None
+
+    # 资源时长
+    voice_duration: Optional[float] = None
+
+    def __post_init__(self):
+        """dataclass 初始化后自动调用，标准化 emotion 字段"""
+        from normalize import EmotionTag
+        self.emotion = EmotionTag.to_str(self.emotion)
 
     def to_dict(self) -> dict:
         return {
@@ -109,8 +149,13 @@ class DialogueEvent(NarrativeEvent):
             "text": self.text,
             "emotion": self.emotion,
             "is_monologue": self.is_monologue,
+            "portrait_position": self.portrait_position,
+            "voice_id": self.voice_id,
             "voice_key": self.voice_key,
-            "image_key": self.image_key
+            "image_key": self.image_key,
+            "voice_url": self.voice_url,
+            "image_url": self.image_url,
+            "voice_duration": self.voice_duration
         }
 
 
@@ -119,15 +164,25 @@ class NarrationEvent(NarrativeEvent):
     """旁白/动作事件"""
     event_type: str = "narration"
     text: str = ""
+    voice_id: Optional[str] = None
 
-    # 资源 key（可选，有旁白配音时）
+    # 资源 key（内部使用，可选，有旁白配音时）
     voice_key: Optional[str] = None
+
+    # 资源 URL（流式输出时填充）
+    voice_url: Optional[str] = None
+
+    # 资源时长
+    voice_duration: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
             "text": self.text,
-            "voice_key": self.voice_key
+            "voice_id": self.voice_id,
+            "voice_key": self.voice_key,
+            "voice_url": self.voice_url,
+            "voice_duration": self.voice_duration
         }
 
 
@@ -135,17 +190,22 @@ class NarrationEvent(NarrativeEvent):
 class AudioEvent(NarrativeEvent):
     """音频事件（音乐/环境音/音效）"""
     event_type: str = "audio"
+    # 资源 key（内部使用）
     audio_key: Optional[str] = None
     # music / ambient / sound
     channel: Optional[str] = None
     description: str = field(default="")
+
+    # 资源 URL（流式输出时填充）
+    audio_url: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
             "channel": self.channel,
             "description": self.description,
-            "audio_key": self.audio_key
+            "audio_key": self.audio_key,
+            "audio_url": self.audio_url
         }
 
 
@@ -197,7 +257,7 @@ class StoryEngine:
     """
 
     def __init__(self,
-                 story_input: dict,
+                 story_input: StoryInput,
                  request_id: str = None,
                  narration_voice: str = None,
                  default_age: str = "青年",
@@ -206,7 +266,7 @@ class StoryEngine:
                  cache_ttl: int = 86400):
         """
         Args:
-            story_input: 故事输入（包含 logline, roles, tags）
+            story_input: 故事创意输入模型
             request_id: 请求 ID（用于缓存隔离）
             narration_voice: 旁白音色 ID
             default_age: 默认年龄段
@@ -224,8 +284,8 @@ class StoryEngine:
         # XML 解析器
         self.xml_parser = utils.XMLParser()
 
-        # 角色和场景信息
-        self.characters: Dict[str, dict] = {}
+        # 角色和场景信息（运行时数据）
+        self.character_dict: Dict[str, dict] = {}  # 角色字典：name -> 角色详细信息
         self.scenes: Dict[str, dict] = {}
         self.voices: Dict[str, str] = {}  # voice_key -> voice_id 缓存
 
@@ -234,14 +294,13 @@ class StoryEngine:
         self.think = ""
         self.script = ""
 
-        # 故事输入
-        self.logline = story_input.get("logline")
-        self.roles = utils.format_roles(story_input.get("roles"))
-        self.tags = utils.format_tags(story_input.get("tags"))
+        # 保存 StoryInput 模型
+        self.story_input = story_input
 
-        # 预加载角色
-        for role in story_input.get("roles", []):
-            self.characters.setdefault(role["name"], role)
+        # 预加载角色到字典中
+        for char in story_input.characters:
+            char_dict = char.to_dict()
+            self.character_dict.setdefault(char_dict["name"], char_dict)
 
         # 任务管理和资源追踪
         self.task_manager: Optional[TaskManager] = None
@@ -276,7 +335,7 @@ class StoryEngine:
         if cached_characters and isinstance(cached_characters, dict):
             # 合并而不是覆盖（保留 story_input 中的角色基础信息）
             for name, data in cached_characters.items():
-                self.characters.setdefault(name, {}).update(data)
+                self.character_dict.setdefault(name, {}).update(data)
             logger.debug(f"Loaded {len(cached_characters)} characters from cache")
 
         # 加载场景信息
@@ -293,7 +352,7 @@ class StoryEngine:
 
     def _save_characters(self):
         """保存角色信息到 Redis"""
-        self.cache.set(self._redis_key("characters"), self.characters, ttl=self.cache_ttl)
+        self.cache.set(self._redis_key("characters"), self.character_dict, ttl=self.cache_ttl)
 
     def _save_scenes(self):
         """保存场景信息到 Redis"""
@@ -316,11 +375,19 @@ class StoryEngine:
     @property
     def story_prompt(self) -> str:
         """获取完整的故事提示词"""
-        if not self.logline or not self.roles or not self.tags or not self.think:
+        if not self.story_input.logline or not self.story_input.characters or not self.story_input.tags or not self.think:
             raise Exception("Story is not complete")
 
+        # 格式化角色和标签数据用于提示词
+        characters_list = [char.to_dict() for char in self.story_input.characters]
+        relationships_list = [rel.to_dict() for rel in self.story_input.relationships] if self.story_input.relationships else None
+        tags_dict = self.story_input.tags.to_dict()
+
+        formatted_characters = utils.format_characters(characters_list, relationships_list)
+        formatted_tags = utils.format_tags(tags_dict)
+
         return utils.format_story(
-            self.logline, self.roles, self.tags,
+            self.story_input.logline, formatted_characters, formatted_tags,
             think=self.think, script=self.script
         )
 
@@ -388,53 +455,73 @@ class StoryEngine:
         self.tracker.register(voice_key)
 
         # 检查是否已有详情
-        if name in self.characters and self.characters[name].get("periods"):
-            details = self.characters[name]["periods"].get(age)
+        if name in self.character_dict and self.character_dict[name].get("periods"):
+            details = self.character_dict[name]["periods"].get(age)
             if details:
+                logger.debug(f"Character {name}-{age} found in cache with periods")
                 self.tracker.set_result(voice_key, details.get("voice", self.default_voice))
-                return None  # 已生成
+
+                # 检查立绘资源是否真的存在
+                tag = self._character_tag(name, age)
+                portrait_key = self._redis_key(f"portrait_{tag}")
+
+                if portrait_key in self.tracker._resources:
+                    logger.debug(f"Portrait resource exists for {name}-{age}, skipping generation")
+                    return None  # 已生成且资源存在
+                else:
+                    logger.warning(f"Character {name}-{age} in cache but portrait resource missing, regenerating...")
+                    # 继续执行下面的生成流程
 
         # 初始化角色数据
-        self.characters.setdefault(name, {})
-        self.characters[name].setdefault("periods", {})
+        self.character_dict.setdefault(name, {})
+        self.character_dict[name].setdefault("periods", {})
 
         # 获取角色详情
         character = f"{name} - {age}"
-        character_details = await dify.character_details(self.story_prompt, character)
-        self.tracker.set_result(voice_key, character_details.get("voice", self.default_voice))
 
-        character_prompt = utils.format_character_prompt(character_details)
+        try:
+            character_details = await dify.character_details(self.story_prompt, character)
+            self.tracker.set_result(voice_key, character_details.get("voice", self.default_voice))
 
-        # 更新角色信息
-        if character_details.get("gender") and not self.characters[name].get("gender"):
-            self.characters[name]["gender"] = character_details["gender"]
+            character_prompt = utils.format_character_prompt(character_details)
 
-        self.characters[name]["periods"][age] = {"prompt": character_prompt}
-        self.characters[name]["periods"][age].update(character_details)
+            # 更新角色信息
+            if character_details.get("gender") and not self.character_dict[name].get("gender"):
+                self.character_dict[name]["gender"] = character_details["gender"]
 
-        # 持久化角色信息
-        self._save_characters()
+            self.character_dict[name]["periods"][age] = {"prompt": character_prompt}
+            self.character_dict[name]["periods"][age].update(character_details)
 
-        # 提交立绘任务
-        tag = self._character_tag(name, age)
-        resource_key = self._redis_key(f"portrait_{tag}")
+            # 持久化角色信息
+            self._save_characters()
 
-        logger.info(f"Character portrait: {name} - {age}")
+            # 提交立绘任务
+            tag = self._character_tag(name, age)
+            resource_key = self._redis_key(f"portrait_{tag}")
 
-        await self.tracker.submit(
-            key=resource_key,
-            function="tasks.character_portrait",
-            args=[character_prompt],
-            queue="image_generation"
-        )
+            logger.info(f"Character portrait: {name} - {age}")
 
-        return resource_key
+            await self.tracker.submit(
+                key=resource_key,
+                function="tasks.character_portrait",
+                args=[character_prompt],
+                kwargs={"character_name": name, "age": age},  # 传入角色名和年龄
+                queue="image_generation"
+            )
+
+            return resource_key
+
+        except Exception as e:
+            logger.error(f"Failed to generate portrait for {name}-{age}: {e}")
+            # 确保即使失败也设置默认音色，避免资源永久 pending
+            self.tracker.set_result(voice_key, self.default_voice)
+            return None
 
     async def _get_voice_id(self, name: str, age: str, gender: str) -> str:
         """获取角色音色 ID"""
         # 只有脚本范围内的角色才等待获取音色描述
         # 超出脚本范围的角色直接使用默认音色描述
-        if name in self.characters:
+        if name in self.character_dict:
             voice_key = self._voice_resource_key(name, age)
             voice_desc = await self.tracker.get(voice_key, timeout=600, default=self.default_voice)
         else:
@@ -472,7 +559,7 @@ class StoryEngine:
             logger.info("Using cached story script")
             return
 
-        async for chunk in dify.plan_story(self.logline, self.roles, self.tags):
+        async for chunk in dify.plan_story(self.story_input):
             if chunk.get("type") == "think":
                 self.think = chunk.get("content")
                 self.cache.set(self._redis_key("think"), self.think, ttl=self.cache_ttl)
@@ -487,7 +574,7 @@ class StoryEngine:
                         await self._generate_scene_background(event["attrib"])
 
                     elif event["event"] == "end" and event["tag"] == "character":
-                        if event["attrib"].get("name") in self.characters:
+                        if event["attrib"].get("name") in self.character_dict:
                             await self._generate_character_portrait(event["attrib"])
 
                     elif event["event"] == "end" and event["tag"] == "story":
@@ -495,18 +582,31 @@ class StoryEngine:
                         self.cache.set(self._redis_key("script"), self.script, ttl=self.cache_ttl)
 
                         # 为新增的辅助角色生成立绘
-                        all_chars = re.findall(r'<character name="(.*?)" age="(.*?)">', event["xml_text"])
+                        script_root = ET.fromstring(self.script)
+                        all_chars = [(char.get('name'), char.get('age')) for char in script_root.findall('.//character')]
+                        auxiliary_chars = []
+
                         for char_name, char_age in all_chars:
-                            if char_name not in self.characters:
-                                self.characters.setdefault(char_name, {})["age"] = char_age
+                            # 检查这个年龄段的角色是否已经生成（同名不同年龄的角色需要分别生成）
+                            char_key = f"{char_name}-{char_age}"
+                            periods = self.character_dict.get(char_name, {}).get("periods", {})
+
+                            if char_name not in self.character_dict or char_age not in periods:
+                                auxiliary_chars.append(char_key)
+                                self.character_dict.setdefault(char_name, {})["age"] = char_age
                                 await self._generate_character_portrait({"name": char_name, "age": char_age})
+
+                        if auxiliary_chars:
+                            logger.info(f"✨ Generated {len(auxiliary_chars)} auxiliary characters: {', '.join(auxiliary_chars)}")
+                        else:
+                            logger.info("No new auxiliary characters to generate")
 
     async def _process_scene(self, scene_info: SceneInfo) -> AsyncIterator[NarrativeEvent]:
         """处理单个场景，流式输出事件"""
         # 更新角色年龄
         for char in scene_info.characters:
-            if char.name in self.characters:
-                self.characters[char.name]["age"] = char.age
+            if char.name in self.character_dict:
+                self.character_dict[char.name]["age"] = char.age
 
         self.xml_parser.reset()
         event_idx = 0
@@ -528,11 +628,11 @@ class StoryEngine:
                     # 场景开始
                     if xml_event["event"] == "start" and xml_event["tag"] == "scene":
                         bg_id = utils.get_bg_id(scene_info.location, scene_info.time)
-                        music = xml_event["attrib"].get("music")
                         ambient = xml_event["attrib"].get("ambient")
 
                         # 产出场景开始事件
                         yield SceneStartEvent(
+                            scene_id=scene_info.scene_id,
                             scene_index=scene_info.index,
                             title=scene_info.title,
                             location=scene_info.location,
@@ -540,21 +640,6 @@ class StoryEngine:
                             bg_id=bg_id,
                             background_key=self._redis_key(f"bg_{bg_id}")
                         )
-
-                        # 背景音乐
-                        if music and music.lower() not in {"无", "none", "null"}:
-                            music_key = self._redis_key(f"music_{scene_info.index}")
-                            await self.tracker.submit(
-                                key=music_key,
-                                function="tasks.sound_audio",
-                                args=[music, "music"],
-                                queue="audio_processing"
-                            )
-                            yield AudioEvent(
-                                channel="music",
-                                description=music,
-                                audio_key=music_key
-                            )
 
                         # 环境音效
                         if ambient and ambient.lower() not in {"无", "none", "null"}:
@@ -577,22 +662,20 @@ class StoryEngine:
                         default_gender = utils.infer_gender(char_name) or self.default_gender
                         default_age = utils.infer_age(char_name) or self.default_age
 
-                        if char_name in self.characters:
-                            char_gender = self.characters[char_name].get("gender", default_gender)
-                            char_age = self.characters[char_name].get("age", default_age)
+                        if char_name in self.character_dict:
+                            char_gender = self.character_dict[char_name].get("gender", default_gender)
+                            char_age = self.character_dict[char_name].get("age", default_age)
                             char_age = normalize.normalize_age(char_age)
                         else:
                             char_gender = default_gender
                             char_age = default_age
 
                         voice_id = await self._get_voice_id(char_name, char_age, char_gender)
-                        emotion = normalize.normalize_emotion(xml_event["attrib"].get("emotion", "normal"))
+                        # 标准化 emotion（提交任务前必须标准化，API 只接受7种标准情绪）
+                        emotion = xml_event["attrib"].get("emotion", "normal")
+                        emotion = normalize.EmotionTag.to_str(emotion)
                         text = utils.clean_text(xml_event["text"])
                         voice_effect = "monologue" if xml_event["tag"] == "monologue" else None
-
-                        if not text:
-                            with open('logs/temp.txt', 'a') as f:
-                                f.write(xml_event["xml_text"] + "\n")
 
                         # 提交配音任务
                         voice_key = self._redis_key(f"voice_{event_index}")
@@ -612,8 +695,28 @@ class StoryEngine:
                             text=text,
                             emotion=emotion,
                             is_monologue=(xml_event["tag"] == "monologue"),
+                            voice_id=voice_id,
                             voice_key=voice_key,
                             image_key=image_key
+                        )
+
+                    # 背景音乐（中途插入）
+                    elif xml_event["event"] == "end" and xml_event["tag"] == "music":
+                        desc = utils.clean_sound_description(xml_event["text"])
+                        music_key = self._redis_key(f"music_{event_index}")
+
+                        await self.tracker.submit(
+                            key=music_key,
+                            function="tasks.sound_audio",
+                            args=[desc, "music"],
+                            queue="audio_processing"
+                        )
+
+                        # 立即产出事件（资源 key，不等待 URL）
+                        yield AudioEvent(
+                            channel="music",
+                            description=desc,
+                            audio_key=music_key
                         )
 
                     # 音效
@@ -640,10 +743,6 @@ class StoryEngine:
                         text = utils.clean_text(xml_event["text"])
                         voice_key = None
 
-                        if not text:
-                            with open('logs/temp.txt', 'a') as f:
-                                f.write(xml_event["xml_text"] + "\n")
-
                         if self.narration_voice:
                             voice_key = self._redis_key(f"narration_{event_index}")
                             await self.tracker.submit(
@@ -657,8 +756,13 @@ class StoryEngine:
                         # 立即产出事件（资源 key，不等待 URL）
                         yield NarrationEvent(
                             text=text,
+                            voice_id=self.narration_voice,
                             voice_key=voice_key
                         )
+
+                    # 场景结束
+                    elif xml_event["event"] == "end" and xml_event["tag"] == "scene":
+                        yield SceneEndEvent(scene_id=scene_info.scene_id)
 
         except etree.XMLSyntaxError as e:
             logger.warning(f"XML parse error in scene {scene_info.index}: {e}")
@@ -677,6 +781,7 @@ class StoryEngine:
         )
 
         # 4. 从队列处理场景
+        current_chapter_idx = None
         while self.cache.queue_len(self._redis_key("storylets")) > 0:
             scene_data = self.cache.pop(self._redis_key("storylets"))
 
@@ -684,8 +789,13 @@ class StoryEngine:
                 continue
 
             elif scene_data["tag"] == "sequence":
+                # 章节结束事件（如果不是第一个章节）
+                if current_chapter_idx is not None:
+                    yield ChapterEndEvent(chapter_index=current_chapter_idx)
+
+                current_chapter_idx = scene_data["idx"]
                 yield ChapterStartEvent(
-                    chapter_index=scene_data["idx"],
+                    chapter_index=current_chapter_idx,
                     title=scene_data["title"]
                 )
 
@@ -695,6 +805,10 @@ class StoryEngine:
 
                 async for event in self._process_scene(scene_info):
                     yield event
+
+        # 最后一个章节结束
+        if current_chapter_idx is not None:
+            yield ChapterEndEvent(chapter_index=current_chapter_idx)
 
         # 5. 输出故事结束事件
         yield StoryEndEvent()
@@ -722,8 +836,15 @@ class StoryEngine:
                     for c in scene.findall("character")
                 ]
 
+                # 使用场景属性字典的哈希作为场景 ID
+                import hashlib
+                import json
+                attr_str = json.dumps(dict(scene.attrib), sort_keys=True)
+                scene_id = hashlib.md5(attr_str.encode()).hexdigest()[:8]
+
                 scene_info = SceneInfo(
                     index=f"{seq_idx}{scene_idx}",
+                    scene_id=scene_id,
                     title=scene.get("title"),
                     location=scene.get("location"),
                     time=scene.get("time"),
@@ -739,7 +860,7 @@ class StoryEngine:
         return {
             "request_id": self.request_id,
             "title": self.title,
-            "characters_count": len(self.characters),
+            "characters_count": len(self.character_dict),
             "scenes_count": len(self.scenes),
             "pending_resources": self.tracker.pending_count if self.tracker else 0,
             "total_resources": self.tracker.total_count if self.tracker else 0

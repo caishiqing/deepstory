@@ -6,7 +6,7 @@
 """
 from endpoints.mediahub import get_audio_download_url, search_audio, text_to_speech
 from tasks.logger_config import task_logger
-from .models import ResourceResult
+from .models import ResourceResult, AudioResourceResult
 from loguru import logger
 
 
@@ -14,7 +14,7 @@ from loguru import logger
 async def dialogue_asr(voice_id: str,
                        text: str,
                        emotion: str = None,
-                       voice_effect: str = None) -> ResourceResult:
+                       voice_effect: str = None) -> AudioResourceResult:
     """对话配音
 
     Args:
@@ -24,7 +24,7 @@ async def dialogue_asr(voice_id: str,
         voice_effect: 声音特效
 
     Returns:
-        ResourceResult: 包含音频 URL 的结果
+        AudioResourceResult: 包含音频 URL 和时长的结果
     """
     logger.info(f"Dialogue ASR: voice_id={voice_id}, text_len={len(text)}")
 
@@ -37,16 +37,16 @@ async def dialogue_asr(voice_id: str,
         )
 
         audio_url = tts_result["audio_url"]
+        audio_duration = tts_result.get("audio_length")  # 从 TTS 结果中提取时长
 
-        return ResourceResult(
-            resource_type="voice",
-            urls=[audio_url],
-            metadata={
-                "voice_id": voice_id,
-                "text_length": len(text),
-                "emotion": emotion,
-                "voice_effect": voice_effect
-            }
+        return AudioResourceResult(
+            resource_type="audio",
+            url_map={"default": audio_url},
+            duration=audio_duration,
+            voice_id=voice_id,
+            emotion=emotion,
+            voice_effect=voice_effect,
+            text_length=len(text)
         )
 
     except Exception as e:
@@ -56,7 +56,7 @@ async def dialogue_asr(voice_id: str,
 
 @task_logger("sound_audio")
 async def sound_audio(sound_description: str,
-                      sound_type: str) -> ResourceResult:
+                      sound_type: str) -> AudioResourceResult:
     """音效检索
 
     Args:
@@ -64,7 +64,7 @@ async def sound_audio(sound_description: str,
         sound_type: 音效类型（music/ambient/action）
 
     Returns:
-        ResourceResult: 包含音频 URL 的结果（搜索不到时 urls 为空）
+        AudioResourceResult: 包含音频 URL 的结果（搜索不到时 urls 为空）
     """
     logger.info(f"Sound audio: '{sound_description}' ({sound_type})")
 
@@ -73,10 +73,11 @@ async def sound_audio(sound_description: str,
 
         if not sound:
             logger.warning(f"No {sound_type} found for: '{sound_description}'")
-            return ResourceResult(
+            return AudioResourceResult(
                 resource_type="audio",
-                urls=[],
-                metadata={"sound_type": sound_type, "description": sound_description, "found": False}
+                url_map={},
+                sound_type=sound_type,
+                metadata={"description": sound_description, "found": False}
             )
 
         audio_url = await get_audio_download_url(sound["id"])
@@ -84,11 +85,15 @@ async def sound_audio(sound_description: str,
         if not audio_url:
             raise Exception(f"No download URL for audio: {sound['id']}")
 
-        return ResourceResult(
+        # 从音频库获取时长信息（如果有）
+        audio_duration = sound.get("duration")
+
+        return AudioResourceResult(
             resource_type="audio",
-            urls=[audio_url],
+            url_map={"default": audio_url},
+            duration=audio_duration,
+            sound_type=sound_type,
             metadata={
-                "sound_type": sound_type,
                 "description": sound_description,
                 "sound_id": sound["id"],
                 "found": True

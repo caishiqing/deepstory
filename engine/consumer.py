@@ -16,13 +16,14 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Set, TYPE_CHECKING
+from typing import Dict, List, Optional, Any, Set, TYPE_CHECKING, AsyncIterator
 from loguru import logger
 
 from utils import download_file
 
 if TYPE_CHECKING:
     from .tracer import ResourceTracker
+    from .producer import NarrativeEvent
 
 
 # ==================== 工具函数 ====================
@@ -61,21 +62,152 @@ class StreamingConsumer:
     - 每个事件等待其资源 URL 就绪后再 yield
     - 不影响生产任务并发（任务早已提交到后台队列）
     - 不下载资源，只返回 URL（客户端自己加载）
+
+    使用方式（SSE 服务）：
+        consumer = StreamingConsumer(engine.tracker, resource_timeout=3600.0)
+        async for event in consumer.stream(engine):
+            # event 已包含资源 URL
+            yield event.to_dict()
     """
 
-    def __init__(self, tracker: "ResourceTracker"):
+    def __init__(self, tracker: "ResourceTracker", resource_timeout: float = 3600.0):
+        """
+        Args:
+            tracker: 资源追踪器
+            resource_timeout: 资源等待超时时间（秒），默认 3600（1小时）
+        """
         self.tracker = tracker
+        self.resource_timeout = resource_timeout
         # URL 缓存: key -> url
         self._resolved: Dict[str, str] = {}
+        # 监控用：当前事件队列和状态
+        self._event_queue = None
+        self._current_event = {}
 
-    async def resolve_url(self, key: str, timeout: float = 3600.0) -> Optional[str]:
-        """等待资源就绪并返回 URL"""
+    async def stream(self, engine) -> "AsyncIterator[NarrativeEvent]":
+        """
+        流式消费 Engine 事件，等待资源就绪后输出完整事件
+
+        特点：
+        - 保持事件顺序（顺序等待资源）
+        - 生产者跑在前面，确保所有资源任务能提前进入并行队列
+        - 每个事件的资源就绪后才 yield
+        - 输出的事件已包含资源 URL
+        """
+        from .producer import (
+            DialogueEvent, NarrationEvent, AudioEvent, SceneStartEvent
+        )
+
+        # 引入异步队列，让 Producer 不受 Consumer 等待的影响
+        queue = asyncio.Queue(maxsize=1000)
+        self._event_queue = queue  # 暴露队列供监控使用
+
+        async def _producer():
+            """后台生产者：尽可能快地驱动引擎，把任务塞进 Redis"""
+            try:
+                async for event in engine.run():
+                    await queue.put(event)
+                await queue.put(None)  # 结束标志
+            except Exception as e:
+                logger.error(f"Producer error: {e}")
+                await queue.put(e)
+
+        # 启动后台任务
+        producer_task = asyncio.create_task(_producer())
+
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                if isinstance(event, Exception):
+                    raise event
+
+                # 记录当前处理的事件（供监控使用）
+                self._current_event = {'type': event.event_type, 'waiting_for': ''}
+
+                # 等待当前事件的所有资源就绪并填充 URL
+                if isinstance(event, DialogueEvent):
+                    # 等待配音
+                    if event.voice_key:
+                        self._current_event['waiting_for'] = 'voice'
+                        result = await self.tracker.get(event.voice_key, timeout=self.resource_timeout)
+                        if result:
+                            event.voice_url = self._extract_url(result)
+                            # 提取时长（从 AudioResourceResult）
+                            from tasks.models import AudioResourceResult
+                            if isinstance(result, AudioResourceResult):
+                                event.voice_duration = result.duration
+                            elif isinstance(result, dict):
+                                event.voice_duration = result.get("duration") or result.get("audio_length")
+                        else:
+                            logger.warning(f"No result for voice_key: {event.voice_key}")
+
+                    # 等待立绘（根据情绪提取特定 URL）
+                    if event.image_key:
+                        self._current_event['waiting_for'] = 'image'
+                        result = await self.tracker.get(event.image_key, timeout=self.resource_timeout)
+                        if result:
+                            # ✅ 根据对话的情绪提取对应的立绘 URL
+                            event.image_url = self._extract_url(result, emotion=event.emotion)
+                            # 保存完整结果到额外字段，供下载使用
+                            event._portrait_result = result
+                            event._image_result = result  # 保持向后兼容
+                        else:
+                            logger.warning(f"No result for image_key: {event.image_key}")
+
+                elif isinstance(event, NarrationEvent):
+                    if event.voice_key:
+                        self._current_event['waiting_for'] = 'narration_voice'
+                        result = await self.tracker.get(event.voice_key, timeout=self.resource_timeout)
+                        if result:
+                            event.voice_url = self._extract_url(result)
+                            # 提取时长（从 AudioResourceResult）
+                            from tasks.models import AudioResourceResult
+                            if isinstance(result, AudioResourceResult):
+                                event.voice_duration = result.duration
+                            elif isinstance(result, dict):
+                                event.voice_duration = result.get("duration") or result.get("audio_length")
+                        else:
+                            logger.warning(f"No result for voice_key: {event.voice_key}")
+
+                elif isinstance(event, AudioEvent):
+                    if event.audio_key:
+                        self._current_event['waiting_for'] = 'audio'
+                        event.audio_url = await self.resolve_url(event.audio_key, timeout=self.resource_timeout)
+
+                elif isinstance(event, SceneStartEvent):
+                    if event.background_key:
+                        self._current_event['waiting_for'] = 'background'
+                        event.background_url = await self.resolve_url(event.background_key, timeout=self.resource_timeout)
+
+                # 清除等待状态
+                self._current_event = {}
+
+                # 输出完整事件
+                yield event
+        finally:
+            # 确保任务被清理
+            if not producer_task.done():
+                producer_task.cancel()
+
+    async def resolve_url(self, key: str, timeout: float = None) -> Optional[str]:
+        """等待资源就绪并返回 URL
+
+        Args:
+            key: 资源 key
+            timeout: 超时时间（秒），None 则使用实例默认值
+        """
         if not key:
             return None
 
         # 检查缓存
         if key in self._resolved:
             return self._resolved[key]
+
+        # 使用传入的 timeout 或实例默认值
+        if timeout is None:
+            timeout = self.resource_timeout
 
         try:
             result = await self.tracker.get(key, timeout=timeout)
@@ -92,25 +224,100 @@ class StreamingConsumer:
             logger.error(f"Failed to resolve URL for {key}: {e}")
             return None
 
-    def _extract_url(self, result: Any) -> Optional[str]:
-        """从资源结果中提取单个 URL"""
-        urls = self._extract_urls(result)
-        return urls[0] if urls else None
+    def _extract_url(self, result: Any, emotion: str = None) -> Optional[str]:
+        """从资源结果中提取单个 URL
+
+        Args:
+            result: ResourceResult 对象或兼容格式
+            emotion: 如果是 PortraitResourceResult，指定要提取的情绪
+
+        Returns:
+            URL 或 None
+        """
+        if result is None:
+            return None
+
+        # 导入强类型（延迟导入避免循环依赖）
+        from tasks.models import AudioResourceResult, ImageResourceResult, PortraitResourceResult, ResourceResult
+
+        # 处理可能的 JSON 字符串（Pydantic 序列化的副作用）
+        if isinstance(result, str) and result.startswith("{"):
+            try:
+                import json
+                result_dict = json.loads(result)
+                # 根据 resource_type 重构为对应的类
+                resource_type = result_dict.get("resource_type")
+                if resource_type == "portrait":
+                    result = PortraitResourceResult(**result_dict)
+                elif resource_type == "audio":
+                    result = AudioResourceResult(**result_dict)
+                elif resource_type == "image":
+                    result = ImageResourceResult(**result_dict)
+                else:
+                    result = ResourceResult(**result_dict)
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON string to ResourceResult: {e}")
+
+        # PortraitResourceResult：根据情绪提取
+        if isinstance(result, PortraitResourceResult):
+            if emotion:
+                return result.get_emotion_url(emotion, fallback=True)
+            return result.primary_url
+
+        # 其他 ResourceResult：使用 primary_url
+        if isinstance(result, ResourceResult):
+            return result.primary_url
+
+        # 字典格式
+        if isinstance(result, dict):
+            url_map = result.get("url_map", {})
+            if url_map:
+                if emotion and emotion in url_map:
+                    return url_map[emotion]
+                # 回退到 default
+                if "default" in url_map:
+                    return url_map["default"]
+                # 使用任意可用 URL
+                return next(iter(url_map.values()), None)
+            return None
+
+        # 字符串（直接是 URL）
+        if isinstance(result, str):
+            return result
+
+        logger.warning(f"Unknown result format: {type(result)}")
+        return None
 
     def _extract_urls(self, result: Any) -> List[str]:
-        """从资源结果中提取所有 URL"""
+        """从资源结果中提取所有 URL（用于下载）"""
         if result is None:
             return []
 
+        from tasks.models import ResourceResult, PortraitResourceResult
+
+        # 处理可能的 JSON 字符串
+        if isinstance(result, str) and result.startswith("{"):
+            try:
+                import json
+                result_dict = json.loads(result)
+                resource_type = result_dict.get("resource_type")
+                if resource_type == "portrait":
+                    result = PortraitResourceResult(**result_dict)
+                else:
+                    result = ResourceResult(**result_dict)
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON string: {e}")
+
         # ResourceResult 对象
-        if hasattr(result, "urls"):
+        if isinstance(result, ResourceResult):
             return result.urls or []
 
         # 字典格式
         if isinstance(result, dict):
-            return result.get("urls", [])
+            url_map = result.get("url_map", {})
+            return list(url_map.values()) if url_map else []
 
-        # 字符串（直接是 URL）
+        # 字符串（单个 URL）
         if isinstance(result, str):
             return [result]
 
@@ -123,6 +330,10 @@ class OfflineConsumer(StreamingConsumer):
     """离线消费者 - 等待资源就绪并下载到本地（支持并行下载）
 
     继承 StreamingConsumer，复用 resolve_url 和 _extract_urls 方法。
+
+    特点：
+    - 按需下载：只下载被实际使用的资源
+    - 对于立绘资源：只下载被引用的情绪图像
     """
 
     def __init__(self, tracker: "ResourceTracker", audio_path: str, image_path: str):
@@ -136,9 +347,27 @@ class OfflineConsumer(StreamingConsumer):
         # 下载缓存: key -> local_path
         self._downloaded: Dict[str, str] = {}
 
+        # 记录被使用的情绪（用于按需下载立绘）
+        # portrait_key -> Set[emotion]
+        self._used_emotions: Dict[str, Set[str]] = {}
+
         # 并行下载相关
         self._running_tasks: Set[asyncio.Task] = set()
         self._semaphore = asyncio.Semaphore(10)
+
+    async def stream(self, engine) -> "AsyncIterator[NarrativeEvent]":
+        """重写流式消费，记录被使用的情绪"""
+        from .producer import DialogueEvent
+
+        async for event in super().stream(engine):
+            # 记录对话事件使用的情绪（用于按需下载立绘）
+            if isinstance(event, DialogueEvent) and event.image_key and event.emotion:
+                if event.image_key not in self._used_emotions:
+                    self._used_emotions[event.image_key] = set()
+                self._used_emotions[event.image_key].add(event.emotion)
+                logger.debug(f"Recorded emotion '{event.emotion}' for {event.image_key}")
+
+            yield event
 
     def schedule_download(self,
                           key: str,
@@ -177,11 +406,23 @@ class OfflineConsumer(StreamingConsumer):
         )
 
         async_task = asyncio.create_task(
-            self._background_download(download_task),
+            self._background_download_with_cleanup(download_task),
             name=key
         )
         self._running_tasks.add(async_task)
         logger.debug(f"Started background download: {key}")
+
+    async def _background_download_with_cleanup(self, task: DownloadTask) -> Optional[str]:
+        """后台下载任务（带自动清理）"""
+        try:
+            result = await self._background_download(task)
+            return result
+        finally:
+            # 任务完成后，从运行中集合移除
+            for running_task in list(self._running_tasks):
+                if running_task.get_name() == task.key:
+                    self._running_tasks.discard(running_task)
+                    break
 
     async def _background_download(self, task: DownloadTask) -> Optional[str]:
         """后台下载任务"""
@@ -217,20 +458,37 @@ class OfflineConsumer(StreamingConsumer):
             return None
 
     async def _do_download_urls(self, task: DownloadTask, urls: List[str]) -> Optional[str]:
-        """实际执行下载（在信号量保护下调用）"""
+        """实际执行下载（在信号量保护下调用）
+
+        对于立绘资源：只下载被实际使用的情绪图像
+        """
         key = task.key
 
-        # 对于角色立绘（包含 portrait_），下载所有图片并按 emotion 命名
+        # 对于角色立绘（包含 portrait_），按需下载
         if "portrait_" in key:
+            # 获取该立绘被使用的情绪
+            used_emotions = self._used_emotions.get(key, set())
+
+            if not used_emotions:
+                logger.warning(f"No emotions recorded for portrait {key}, downloading all")
+                used_emotions = {self._extract_emotion_from_url(url) for url in urls}
+
             first_path = None
+            downloaded_count = 0
+
             for url in urls:
                 emotion = self._extract_emotion_from_url(url)
-                local_path = self._get_save_path(task.resource_type, task.tag, emotion, url)
-                await self._do_download(url, local_path)
-                if first_path is None:
-                    first_path = local_path
+                # ✅ 只下载被使用的情绪
+                if emotion in used_emotions:
+                    local_path = self._get_save_path(task.resource_type, task.tag, emotion, url)
+                    await self._do_download(url, local_path)
+                    downloaded_count += 1
+                    if first_path is None:
+                        first_path = local_path
+                else:
+                    logger.debug(f"Skipping unused emotion '{emotion}' for {key}")
 
-            logger.info(f"Downloaded {len(urls)} images for {key}")
+            logger.info(f"Downloaded {downloaded_count}/{len(urls)} images for {key} (used emotions: {used_emotions})")
             self._downloaded[key] = first_path
             return first_path
         else:
@@ -242,7 +500,10 @@ class OfflineConsumer(StreamingConsumer):
             return local_path
 
     async def wait_all_downloads(self, concurrency: int = None) -> Dict[str, str]:
-        """等待所有后台下载任务完成
+        """等待所有后台下载任务完成（可选方法）
+
+        注意：这个方法是可选的，下载任务会在后台自动完成。
+        只有在需要确保所有资源都下载完成后再继续执行时才需要调用。
 
         Returns:
             Dict[key, local_path] 所有成功下载的资源
@@ -267,19 +528,33 @@ class OfflineConsumer(StreamingConsumer):
         return self._downloaded.copy()
 
     def _extract_emotion_from_url(self, url: str) -> Optional[str]:
-        """从 URL 中提取 emotion 前缀
+        """从 URL 中提取情绪标签
 
-        URL 格式示例: https://xxx/happy_abc123.png -> happy
+        URL 命名规则：{emotion}_xxxxx.png
+        标准情绪标签：happy / sad / surprised / fearful / disgusted / angry / normal
+
+        示例：
+        - https://xxx/fearful_00007.png -> fearful
+        - https://xxx/happy_abc123.png -> happy
         """
         if not url:
             return None
 
-        filename = url.split("/")[-1].split("?")[0]
-        parts = filename.split("_")
-        if len(parts) > 1:
-            return parts[0]
+        try:
+            filename = url.split("/")[-1].split("?")[0]  # 提取文件名
+            name_without_ext = filename.rsplit(".", 1)[0]  # 去除扩展名
 
-        return None
+            # ✅ 直接从 URL 前缀提取情绪标签（第一个下划线前的部分）
+            parts = name_without_ext.split("_")
+            if len(parts) > 1 and parts[0]:
+                return parts[0].lower()
+
+            # 如果没有下划线，整个文件名就是情绪标签
+            return name_without_ext.lower() if name_without_ext else None
+
+        except Exception as e:
+            logger.warning(f"Failed to extract emotion from URL {url}: {e}")
+            return None
 
     def _get_save_path(self, resource_type: str, tag: str, attribute: str, url: str) -> str:
         """根据资源类型确定保存路径
@@ -335,6 +610,11 @@ class OfflineConsumer(StreamingConsumer):
         """已下载的资源数"""
         return len(self._downloaded)
 
+    @property
+    def downloading_count(self) -> int:
+        """正在下载的资源数"""
+        return len(self._running_tasks)
+
     def get_local_path(self, key: str) -> Optional[str]:
         """获取资源的本地路径"""
         return self._downloaded.get(key)
@@ -377,6 +657,91 @@ label ending:
         self.project_path = project_path
         self.script_lines: List[str] = []
         self.is_chapter_start = False
+
+    async def download_and_save(
+        self,
+        url: str = None,
+        resource_type: str = None,
+        tag: str = None,
+        attribute: str = None,
+        key: str = None,
+        result: Any = None
+    ) -> Optional[str]:
+        """
+        同步下载并保存资源（用于顺序处理）
+
+        Args:
+            url: 资源 URL（单个，废弃，使用 result 替代）
+            resource_type: 资源类型 (image/audio/voice)
+            tag: 资源标签前缀
+            attribute: 资源属性（如情绪）
+            key: 资源 key（用于缓存）
+            result: ResourceResult 对象或包含 URLs 的字典（推荐）
+
+        Returns:
+            本地文件路径，失败返回 None
+        """
+        # 检查是否已下载
+        if key and key in self._downloaded:
+            return self._downloaded[key]
+
+        # 提取所有 URLs
+        urls = []
+        if result:
+            urls = self._extract_urls(result)
+        elif url:
+            urls = [url]
+
+        if not urls:
+            return None
+
+        try:
+            # 对于角色立绘（包含 portrait_），按需下载
+            if key and "portrait_" in key:
+                # 获取该立绘被使用的情绪
+                used_emotions = self._used_emotions.get(key, set())
+
+                # 如果指定了 attribute（情绪），只下载该情绪
+                if attribute:
+                    used_emotions = {attribute}
+
+                if not used_emotions:
+                    logger.warning(f"No emotions specified for portrait {key}, downloading all")
+                    used_emotions = {self._extract_emotion_from_url(u) for u in urls}
+
+                first_path = None
+                downloaded_count = 0
+
+                for url_item in urls:
+                    emotion = self._extract_emotion_from_url(url_item)
+                    # ✅ 只下载被使用的情绪
+                    if emotion in used_emotions:
+                        local_path = self._get_save_path(resource_type, tag, emotion, url_item)
+                        await self._do_download(url_item, local_path)
+                        downloaded_count += 1
+                        if first_path is None:
+                            first_path = local_path
+
+                logger.info(f"Downloaded {downloaded_count}/{len(urls)} images for {key} (emotions: {used_emotions})")
+                # ⚠️ 只缓存成功下载的路径，避免存储 None
+                if key and first_path:
+                    self._downloaded[key] = first_path
+                return first_path
+            else:
+                # 单个 URL（非立绘）
+                url_item = urls[0]
+                local_path = self._get_save_path(resource_type, tag, attribute, url_item)
+                await self._do_download(url_item, local_path)
+
+                if key:
+                    self._downloaded[key] = local_path
+
+                logger.debug(f"Downloaded and saved: {local_path}")
+                return local_path
+
+        except Exception as e:
+            logger.error(f"Failed to download {key or url}: {e}")
+            return None
 
     def add_chapter(self, index: int, title: str):
         """添加章节"""
@@ -422,13 +787,10 @@ label ending:
             audio_key: 资源 key
         """
         if channel == "music":
-            # 替换最后一个 stop music
-            for i in range(len(self.script_lines) - 1, -1, -1):
-                if self.script_lines[i].strip() == "stop music":
-                    self.script_lines[i] = f'    play music {{AUDIO:{audio_key}}}'
-                    break
+            # 音乐中途插入，直接添加 play music
+            self.script_lines.append(f'    play music {{AUDIO:{audio_key}}}')
         elif channel == "ambient":
-            # 替换最后一个 stop ambient
+            # 替换最后一个 stop ambient（环境音仍在场景开始时设置）
             for i in range(len(self.script_lines) - 1, -1, -1):
                 if self.script_lines[i].strip() == "stop ambient":
                     self.script_lines[i] = f'    play ambient {{AUDIO:{audio_key}}}'
@@ -445,6 +807,10 @@ label ending:
         # 构建 key -> filename 映射
         key_to_filename = {}
         for key, local_path in self._downloaded.items():
+            # ⚠️ 跳过下载失败或未下载的资源（local_path 可能为 None）
+            if local_path is None:
+                logger.warning(f"Skipping resource with None path: {key}")
+                continue
             filename = os.path.basename(local_path).rsplit(".", 1)[0]
             key_to_filename[key] = filename
 

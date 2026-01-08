@@ -220,6 +220,10 @@ class ResourceResult(BaseModel):
     所有资源生成任务（图像、音频等）都应返回此格式，
     包含资源 URL 和元数据，不再直接下载文件。
     文件命名由消费者（Consumer）自行决定。
+
+    使用 url_map 统一管理资源 URL：
+    - 单个 URL：{"default": "url"}
+    - 多状态资源（如立绘）：{"happy": "url1", "sad": "url2"}
     """
 
     model_config = ConfigDict(
@@ -227,14 +231,108 @@ class ResourceResult(BaseModel):
         use_enum_values=True,
     )
 
-    resource_type: str = Field(..., description="资源类型: image/audio/voice")
-    urls: List[str] = Field(default_factory=list, description="资源 URL 列表")
+    resource_type: str = Field(..., description="资源类型: image/audio/voice/portrait")
+    url_map: Dict[str, str] = Field(default_factory=dict, description="状态 -> URL 映射")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据")
 
     @property
     def primary_url(self) -> Optional[str]:
-        """获取主要 URL（第一个）"""
-        return self.urls[0] if self.urls else None
+        """获取主要 URL（优先 default，否则第一个）"""
+        if "default" in self.url_map:
+            return self.url_map["default"]
+        return next(iter(self.url_map.values()), None)
+
+    @property
+    def urls(self) -> List[str]:
+        """获取所有 URL 列表"""
+        return list(self.url_map.values())
+
+    def get_url(self, key: str = "default", fallback: bool = True) -> Optional[str]:
+        """获取指定 key 的 URL
+
+        Args:
+            key: URL 的 key（如 "default"、"happy" 等）
+            fallback: 如果 key 不存在，是否回退到其他 URL
+
+        Returns:
+            URL 或 None
+
+        智能兜底逻辑：
+        1. 如果 url_map 只有一个 URL，直接返回（无论 key 是什么）
+        2. 如果指定的 key 存在，返回对应的 URL
+        3. 如果 key 不存在且 fallback=True，尝试回退到 "default" 或第一个 URL
+        """
+        # 智能兜底：如果只有一个 URL，直接返回
+        if len(self.url_map) == 1:
+            return next(iter(self.url_map.values()))
+
+        # 优先使用指定的 key
+        if key in self.url_map:
+            return self.url_map[key]
+
+        if not fallback:
+            return None
+
+        # 回退到 default
+        if "default" in self.url_map:
+            return self.url_map["default"]
+
+        # 使用任意可用的 URL
+        return next(iter(self.url_map.values()), None)
+
+
+class AudioResourceResult(ResourceResult):
+    """音频资源结果（配音、音乐、音效）
+
+    专门用于音频类资源，包含时长、音色等关键信息
+    通常只有一个 URL：{"default": "url"}
+    """
+    resource_type: str = "audio"
+    duration: Optional[float] = Field(None, description="音频时长（秒）")
+    voice_id: Optional[str] = Field(None, description="音色 ID")
+    emotion: Optional[str] = Field(None, description="情绪类型")
+    voice_effect: Optional[str] = Field(None, description="声音特效")
+    text_length: Optional[int] = Field(None, description="文本长度")
+    sound_type: Optional[str] = Field(None, description="音效类型（music/ambient/action）")
+
+
+class ImageResourceResult(ResourceResult):
+    """图像资源结果（背景等单图资源）
+
+    通常只有一个 URL：{"default": "url"}
+    """
+    resource_type: str = "image"
+    width: Optional[int] = Field(None, description="图像宽度")
+    height: Optional[int] = Field(None, description="图像高度")
+
+
+class PortraitResourceResult(ResourceResult):
+    """角色立绘资源结果（多情绪）
+
+    特点：
+    - 一次生成多个情绪变体（利用 batch 优势）
+    - 使用 url_map 存储情绪 -> URL 映射（继承自基类）
+    - 事件引用时通过 emotion 精确提取所需 URL
+
+    url_map 示例：{"happy": "url1", "sad": "url2", "normal": "url3"}
+    """
+    resource_type: str = "portrait"
+    character: Optional[str] = Field(None, description="角色名")
+    age: Optional[str] = Field(None, description="年龄段")
+    width: Optional[int] = Field(None, description="图像宽度")
+    height: Optional[int] = Field(None, description="图像高度")
+
+    def get_emotion_url(self, emotion: str, fallback: bool = True) -> Optional[str]:
+        """获取指定情绪的 URL
+
+        Args:
+            emotion: 目标情绪
+            fallback: 是否在情绪不存在时回退到其他情绪
+
+        Returns:
+            URL 或 None
+        """
+        return self.get_url(emotion, fallback=fallback)
 
 
 # 所有数据模型现在都可以直接使用 Pydantic 的内置序列化方法：

@@ -1,6 +1,16 @@
-# ARQ 任务队列配置文件
+# DeepStory 统一配置文件
 
-# Redis 连接配置
+# ==================== 数据库配置 ====================
+database:
+  # PostgreSQL 连接 URL
+  url: "postgresql://user:password@localhost:5432/deepstory"
+  # 连接池配置
+  pool_size: 20
+  max_overflow: 10
+  # 是否启用数据库（当前系统主要使用 engine 模块，可选）
+  enabled: false
+
+# ==================== Redis 配置 ====================
 redis:
   host: localhost
   port: 6379
@@ -9,7 +19,7 @@ redis:
   ssl: false
   max_connections: 20
 
-# 队列配置 - 支持多个队列组
+# ==================== ARQ 任务队列配置 ====================
 queues:
   image_generation:
     name: "image_generation"
@@ -27,9 +37,42 @@ queues:
     max_tries: 3
     retry_delay: [5, 15, 45]
 
-# 全局设置
+# ==================== ARQ 全局设置 ====================
 global:
   health_check_interval: 30
   log_results: true
   allow_abort_jobs: true
   audio_search_threshold: 0.42
+
+# ==================== FastAPI 应用配置 ====================
+app:
+  name: "DeepStory API"
+  version: "1.0.0"
+  api_prefix: "/api/v1"
+  debug: false
+
+# ==================== JWT 认证配置 ====================
+jwt:
+  secret_key: "your-secret-key-change-in-production"
+  algorithm: "HS256"
+  expire_minutes: 10080  # 7 days
+
+# ==================== CORS 配置 ====================
+cors:
+  origins:
+    - "http://localhost:3000"
+    - "http://localhost:5173"
+
+# ==================== SSE 配置 ====================
+sse:
+  heartbeat_interval: 30  # 秒
+  retry_timeout: 10000    # 毫秒
+
+# ==================== 业务规则配置 ====================
+business:
+  # 限流配置
+  rate_limit_per_minute: 60
+  rate_limit_per_hour: 1000
+  # 分页配置
+  default_page_size: 20
+  max_page_size: 100

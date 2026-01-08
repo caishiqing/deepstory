@@ -184,9 +184,9 @@ def format_scene_prompt(scene_detail: dict):
     return "\n".join(details)
 
 
-def format_roles(roles: List[dict]):
+def format_characters(characters: List[dict], relationships: List[dict] = None):
     text = ""
-    for i, role in enumerate(roles):
+    for i, role in enumerate(characters):
         if not role.get("name"):
             continue
         text += f"\n### {role['name']}\n"
@@ -239,6 +239,11 @@ def format_roles(roles: List[dict]):
         if "connection" in role:
             text += f"- 观众共情点：{role['connection']}\n"
 
+    if relationships:
+        text += "\n**人物关系**:\n"
+        for relation in relationships:
+            text += f"- {relation['subject']} & {relation['object']}: {relation['relationship']}\n"
+
     return text.strip()
 
 
@@ -267,7 +272,7 @@ STORY_TEMPLATE = """
 {logline}
 
 ## 角色列表
-{roles}
+{characters}
 
 ## 类型标签
 {tags}
@@ -275,17 +280,17 @@ STORY_TEMPLATE = """
 
 
 def format_story(logline: str,
-                 roles: Union[str, List[Dict]],
+                 characters: Union[str, List[Dict]],
                  tags: Union[str, Dict],
                  think: str = None,
                  script: str = None):
 
-    if not isinstance(roles, str):
-        roles = format_roles(roles)
+    if not isinstance(characters, str):
+        characters = format_characters(characters)
     if not isinstance(tags, str):
         tags = format_tags(tags)
 
-    story = STORY_TEMPLATE.format(logline=logline, roles=roles, tags=tags)
+    story = STORY_TEMPLATE.format(logline=logline, characters=characters, tags=tags)
     if think:
         story += f"\n\n# 故事规划\n\n{think}"
     if script:
@@ -364,7 +369,7 @@ class XMLParser:
 
             for event, element in self.parser.read_events():
                 # 获取元素的完整XML文本
-                xml_text = etree.tostring(element, encoding='unicode', method='xml')
+                xml_text = etree.tostring(element, method='c14n').decode('utf-8')
                 yield {
                     "event": event,
                     "tag": element.tag,
