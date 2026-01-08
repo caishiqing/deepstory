@@ -302,8 +302,8 @@ CREATE TRIGGER users_search_update
     "name": "艾莉丝",
     "basic_info": {
       "gender": "女",
-      "age": 28,
-      "occupation": "量子物理学家"
+      "age": "青年",
+      "identity": "量子物理学家"
     },
     "description": "冷静理性的科学家，对时间裂缝有独特见解"
   },
@@ -311,8 +311,8 @@ CREATE TRIGGER users_search_update
     "name": "鲍勃",
     "basic_info": {
       "gender": "男",
-      "age": 32,
-      "occupation": "时空工程师"
+      "age": "成年",
+      "identity": "时空工程师，主角的上司"
     },
     "description": "热情冲动的冒险家，愿意为爱穿越时空"
   }
